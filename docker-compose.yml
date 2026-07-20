@@ -1,0 +1,79 @@
+services:
+
+  # ────────────────────────────────────────
+  # PostgreSQL - Keycloak のデータ永続化
+  # ────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    env_file: .env.docker
+    # POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD を .env.docker から読み込む
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    # Keycloak が起動する前に DB が準備完了しているかチェック
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ────────────────────────────────────────
+  # Keycloak v26 (Quarkus ベース)
+  # ────────────────────────────────────────
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    env_file: .env.docker
+    environment:
+      # DB 接続設定
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-keycloak}
+      KC_DB_USERNAME: ${POSTGRES_USER:-postgres}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres_local_password}
+      # ローカル開発用の緩い設定（本番では変更が必要）
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+    # start-dev = 開発モード（ホットリロード・デバッグログあり、本番は start を使う）
+    command: start-dev
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy  # postgres の healthcheck が通るまで待機
+    networks:
+      - backend   # postgres への接続
+      - frontend  # ブラウザからのアクセス（OIDC リダイレクト等）
+
+  # ────────────────────────────────────────
+  # nginx - Next.js 静的ファイル配信
+  # ────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      # Next.js ビルド成果物（out/）をコンテナ内にマウント
+      - ./out:/usr/share/nginx/html:ro
+      # nginx の設定ファイルをマウント
+      - ./docker/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - frontend
+    depends_on:
+      - keycloak
+
+# ────────────────────────────────────────
+# ネットワーク設計
+# frontend: ブラウザ ↔ nginx ↔ Keycloak
+# backend:  Keycloak ↔ PostgreSQL（外部から直接アクセス不可）
+# ────────────────────────────────────────
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+
+# ────────────────────────────────────────
+# 名前付きボリューム（コンテナを削除しても DB データが残る）
+# ────────────────────────────────────────
+volumes:
+  postgres_data:
