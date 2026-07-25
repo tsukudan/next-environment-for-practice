@@ -1,0 +1,88 @@
+name: Deploy to ECS
+
+# 手動実行のみ。GitHubのActionsタブから「Run workflow」で実行できる
+on:
+  workflow_dispatch:
+
+# OIDCトークンの発行とコードの読み取りに必要な最小権限
+permissions:
+  id-token: write  # OIDCトークンを発行する権限
+  contents: read   # リポジトリのコードをチェックアウトする権限
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPOSITORY: next-practice/frontend
+  ECS_CLUSTER: next-practice-cluster
+  ECS_SERVICE: next-practice-frontend-svc
+  TASK_DEFINITION_FAMILY: next-practice-frontend
+  CONTAINER_NAME: frontend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ステップ1: リポジトリのコードをチェックアウト
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ステップ2: OIDCでAWSの一時的な認証情報を取得
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::156428223749:role/GitHubActions-next-practice-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ステップ3: ECRにDockerをログイン
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ステップ4: Dockerイメージをビルドしてプッシュ
+      # タグを2つ付ける:
+      #   - github.sha: コミットハッシュ（どのコードからビルドされたか追跡できる）
+      #   - latest: 最新イメージの目印
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            --provenance=false \
+            --sbom=false \
+            -f docker/nginx/Dockerfile \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # ステップ5: 現在のタスク定義をAWSから取得
+      # ローカルにハードコードせず、常に最新のタスク定義を使う
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.TASK_DEFINITION_FAMILY }} \
+            --query taskDefinition \
+            > task-definition.json
+
+      # ステップ6: タスク定義のイメージURIをコミットSHAタグのものに書き換え
+      - name: Render new task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      # ステップ7: 新しいタスク定義をECSに登録してサービスを更新
+      # wait-for-service-stability: デプロイ完了まで待機してからワークフローを終了する
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
